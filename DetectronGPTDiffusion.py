@@ -19,9 +19,16 @@ from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 import pathlib
 
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import mean_squared_error
+
+# Import the necessary libraries for partitioning the dataset into train and test sets
+from sklearn.model_selection import train_test_split
+
 
 class DetectronGPTDiffusion(nn.Module):
     def __init__(self):
+        super(DetectronGPTDiffusion, self).__init__()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # Detectron2 parts
@@ -42,22 +49,33 @@ class DetectronGPTDiffusion(nn.Module):
             "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
         )
         self.metadata = MetadataCatalog.get(self.cfg.DATASETS.TRAIN[0])
-        self.predictor = DefaultPredictor(self.cfg)
+        # This is the main detectron module
+        # This has no .parameters() function so we assume it's already frozen
+        self.detectron = DefaultPredictor(self.cfg)
 
         # GPT-J parts
         self.tokenizer = AutoTokenizer.from_pretrained("gpt2-large")
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.gpt = AutoModelForCausalLM.from_pretrained(
             "gpt2-large", cache_dir=pathlib.Path("cache").resolve()
         ).to(self.device)
 
         # Diffusion parts
+        # This has no .parameters() function so we assume it's already frozen
         self.diffusion_model = DiffusionPipeline.from_pretrained(
             "runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16
         ).to(self.device)
 
     def partition_image(self, image_dir: str = "input.jpg"):
         im = cv2.imread(image_dir)
-        outputs = self.predictor(im)
+        # Round down the image's height and width to the nearest multiple of 8
+        # (the largest multiple of 8 that is smaller than the image's height and width)
+        im_height = im.shape[0]
+        im_width = im.shape[1]
+        im_height = im_height - (im_height % 8)
+        im_width = im_width - (im_width % 8)
+        im = cv2.resize(im, (im_width, im_height))
+
+        outputs = self.detectron(im)
         predictions = outputs["instances"]
 
         boxes = predictions.pred_boxes if predictions.has("pred_boxes") else None
@@ -72,9 +90,9 @@ class DetectronGPTDiffusion(nn.Module):
             predictions.pred_keypoints if predictions.has("pred_keypoints") else None
         )
 
-        return [boxes, scores, classes, labels, keypoints]
+        return im, [boxes, scores, classes, labels, keypoints]
 
-    def gpt_post_process(self, output_sequences):
+    def gpt_post_process(self, output_sequences, input_prompt):
         predictions = []
         generated_sequences = []
 
@@ -88,6 +106,8 @@ class DetectronGPTDiffusion(nn.Module):
                 clean_up_tokenization_spaces=True,
                 skip_special_tokens=True,
             )
+            # Take out the prompt given to it by us
+            text = text[len(input_prompt) :]
             generated_sequences.append(text.strip())
 
         for i, g in enumerate(generated_sequences):
@@ -110,27 +130,31 @@ class DetectronGPTDiffusion(nn.Module):
 
         return predictions
 
-    def gpt_generate(self, prompt):
-        num_sequences = 10
-        # Generation settings:
-        min_length = 100
-        max_length = 160
-        temperature = 1  # min:0, max:3, step:0.01
-        top_p = 0.95  #  min:0, max:1, step:0.01
-        top_k = 50
-        # This is very critical for GPT-2
-        repetition_penalty = 1.0
+    # temp = min:0, max:3, step:0.01
+    # top_p = # min:0, max:1, step:0.01
+    # repetition penalty is very critical for GPT-2
+    # TODO: Move these gpt generation parameters to the __init__ function
+    def gpt_generate(
+        self,
+        prompt,
+        num_sequences=1,
+        min_length=128,
+        max_length=256,
+        temperature=1,
+        top_p=0.95,
+        top_k=50,
+        repetition_penalty=1.0,
+    ):
 
         prompt_full = self.tokenizer(
             prompt, add_special_tokens=False, return_tensors="pt"
         ).to(self.device)
         encoded_prompt = prompt_full.input_ids
         encoded_prompt = encoded_prompt.to(self.device)
-        # max_length = tokenizer.model_max_length
-        # prediction
+
         output_sequences = self.gpt.generate(
             input_ids=encoded_prompt,
-            max_length=max_length,
+            max_new_tokens=max_length,
             attention_mask=prompt_full.attention_mask,
             min_length=min_length,
             temperature=float(temperature),
@@ -141,10 +165,82 @@ class DetectronGPTDiffusion(nn.Module):
             num_return_sequences=num_sequences,
         )
 
-        return self.gpt_post_process(output_sequences)
+        return self.gpt_post_process(output_sequences, prompt)
 
-    def generate_image(self, prompt):
-        return self.diffusion_model(prompt).images
+    def generate_image(self, prompt, height=256, width=256):
+        # All of these parts are to pass CLIP's limit of 77 tokens
+        max_length = self.diffusion_model.tokenizer.model_max_length
+        input_ids = self.diffusion_model.tokenizer(
+            prompt, return_tensors="pt"
+        ).input_ids
+        input_ids = input_ids.to(self.device)
+
+        negative_ids = self.diffusion_model.tokenizer(
+            "",
+            truncation=False,
+            padding="max_length",
+            max_length=input_ids.shape[-1],
+            return_tensors="pt",
+        ).input_ids
+        negative_ids = negative_ids.to(self.device)
+
+        concat_embeds = []
+        neg_embeds = []
+        for i in range(0, input_ids.shape[-1], max_length):
+            concat_embeds.append(
+                self.diffusion_model.text_encoder(input_ids[:, i : i + max_length])[0]
+            )
+            neg_embeds.append(
+                self.diffusion_model.text_encoder(negative_ids[:, i : i + max_length])[
+                    0
+                ]
+            )
+
+        prompt_embeds = torch.cat(concat_embeds, dim=1)
+        negative_prompt_embeds = torch.cat(neg_embeds, dim=1)
+
+        return self.diffusion_model(
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            height=height,
+            width=width,
+        ).images
+
+    def generate_description(self, boxes, labels):
+        full_str = ""
+        for i in range(len(boxes)):
+            box = boxes[i]
+            label = labels[i]
+            box_array = box.tensor.flatten().tolist()
+            # Just the pixel is enough, no floating points
+            box_array = [int(x) for x in box_array]
+            full_str += f"a {label} at {box_array}, "
+        return full_str
+
+    def forward(self, image_dir: str):
+        input_image, [
+            boxes,
+            scores,
+            classes,
+            labels,
+            keypoints,
+        ] = self.partition_image(image_dir)
+        height = input_image.shape[0]
+        width = input_image.shape[1]
+        description = self.generate_description(boxes, labels)
+        prompt = (
+            "We would like to generate a text prompt that will be used to generate an image. In this image, [a, b, c, d] represents the position of the object in the image. In the prompt, describe the objects to be included as well as their positions."  # noqa: E501
+            + description
+        )
+        engineered_prompt = self.gpt_generate(prompt)[0]
+        output_image = self.generate_image(engineered_prompt, height, width)[0]
+
+        return {
+            "manual_prompt": prompt,
+            "output_prompt": engineered_prompt,
+            "input_image": input_image,
+            "output_image": output_image,
+        }
 
 
 def _create_text_labels(classes, class_names, is_crowd=None):
@@ -168,3 +264,66 @@ def _create_text_labels(classes, class_names, is_crowd=None):
     if labels is not None and is_crowd is not None:
         labels = [l + ("|crowd" if crowd else "") for l, crowd in zip(labels, is_crowd)]
     return labels
+
+
+def ssim_loss(input_image, output_image):
+    # Calculate the score between the input and output images
+    input_np = np.array(input_image)
+    output_np = np.array(output_image)
+    score = ssim(input_np, output_np, channel_axis=2)
+    return 1 - score
+
+
+# A function which returns the filenames of all the images in a directory
+def get_image_filenames(directory):
+    # Get all the filenames
+    filenames = os.listdir(directory)
+    # Filter out the non-image files
+    filenames = [f for f in filenames if f.endswith(".jpg")]
+    # Add the directory to the filenames
+    filenames = [os.path.join(directory, f) for f in filenames]
+    return filenames
+
+
+# Optimize the parameters of the gpt part of the model
+def optimize_gpt(
+    model: DetectronGPTDiffusion,
+    num_steps=10,
+    learning_rate=0.01,
+):
+    # Get the dataset
+    dataset = get_image_filenames(
+        "/content/drive/Shareddrives/COM SCI 263/Final Project/Data/COCO/val2017"
+    )[:num_steps]
+    # We use run the model one time for each image in the dataset
+    # (Filtered to only n_steps images)
+    test, train = train_test_split(dataset, test_size=0.2, random_state=42)
+
+    # Define the optimizer
+    optimizer = torch.optim.Adam(
+        [
+            {
+                "params": model.gpt.parameters(),
+                "lr": learning_rate,
+            },
+        ]
+    )
+
+    # Optimize the parameters
+    for i in range(num_steps):
+        # Reset the gradients
+        optimizer.zero_grad()
+
+        model_output = model.forward(train[i])
+
+        # Calculate the loss
+        loss = ssim_loss(model_output["input_image"], model_output["output_image"])
+
+        # Print the loss
+        print(f"Step: {i}, Loss: {loss}")
+
+        # Backpropagate the loss
+        loss.backward()
+
+        # Update the parameters
+        optimizer.step()
