@@ -244,8 +244,6 @@ def _create_text_labels(classes, class_names, is_crowd=None):
     return labels
 
 
-## Second cell
-
 import torchvision.transforms as transforms
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 
@@ -285,7 +283,7 @@ def optimize_gpt(
     )[:dataset_size]
     # We use run the model one time for each image in the dataset
     # (Filtered to only n_steps images)
-    test, train = train_test_split(dataset, test_size=0.2, random_state=42)
+    train, test = train_test_split(dataset, test_size=0.2, random_state=42)
 
     # Define the optimizer
     optimizer = torch.optim.Adam(
@@ -304,7 +302,7 @@ def optimize_gpt(
         current_epoch_losses = []
         print(f"Epoch #{epoch}:")
 
-        for step in range(len(train)):
+        for i in range(len(train)):
             # Reset the gradients
             optimizer.zero_grad()
 
@@ -314,8 +312,8 @@ def optimize_gpt(
             loss = ssim_loss(model_output["input_image"], model_output["output_image"])
 
             # Print the loss
-            if step % 5 == 0:
-                print(f"Step: {step}, Loss: {loss}")
+            if i % 5 == 0:
+                print(f"Step: {i}, Loss: {loss}")
 
             # Backpropagate the loss
             loss.requires_grad = True
@@ -340,7 +338,7 @@ def evaluate_gpt(model: DetectronGPTDiffusion, dataset_size=None):
     )[:dataset_size]
     # We use run the model one time for each image in the dataset
     # (Filtered to only n_steps images)
-    test, train = train_test_split(dataset, test_size=0.2, random_state=42)
+    train, test = train_test_split(dataset, test_size=0.2, random_state=42)
 
     all_losses = []
 
@@ -358,6 +356,8 @@ def evaluate_gpt(model: DetectronGPTDiffusion, dataset_size=None):
     average_loss = sum(all_losses) / len(all_losses)
     print(f"Average loss: {average_loss}")
 
+    return all_losses
+
 
 # Visualize the loss over time
 def visualize_loss(all_epoch_losses):
@@ -366,3 +366,17 @@ def visualize_loss(all_epoch_losses):
     plt.xlabel("Step")
     plt.ylabel("Loss")
     plt.show()
+
+
+pipeline = DetectronGPTDiffusion()
+
+total_losses = optimize_gpt(pipeline, n_epochs=2, dataset_size=10)
+total_losses = [[loss.detach().numpy() for loss in epoch_loss] for epoch_loss in total_losses]
+
+for epoch_losses in total_losses:
+    visualize_loss(epoch_losses)
+
+eval_losses = evaluate_gpt(pipeline, dataset_size=10)
+eval_losses = [loss.detach().numpy() for loss in eval_losses] 
+
+visualize_loss(eval_losses)
