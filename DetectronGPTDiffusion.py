@@ -1,26 +1,19 @@
 import os
-
 import cv2
-import detectron2
-import numpy as np
 import torch
 
 # import some common detectron2 utilities
 from detectron2 import model_zoo
 from detectron2.config import get_cfg
-from detectron2.data import DatasetCatalog, MetadataCatalog
+from detectron2.data import MetadataCatalog
 from detectron2.engine import DefaultPredictor
-from detectron2.utils.visualizer import Visualizer, _create_text_labels
 from diffusers import DiffusionPipeline
 
-from PIL import Image
-from sklearn.metrics.pairwise import cosine_similarity
 from torch import nn
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from PIL import Image
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import pathlib
-
-from skimage.metrics import structural_similarity as ssim
-from skimage.metrics import mean_squared_error
+import matplotlib.pyplot as plt
 
 # Import the necessary libraries for partitioning the dataset into train and test sets
 from sklearn.model_selection import train_test_split
@@ -96,8 +89,6 @@ class DetectronGPTDiffusion(nn.Module):
         predictions = []
         generated_sequences = []
 
-        max_repeat = 2
-
         # decode prediction
         for generated_sequence_idx, generated_sequence in enumerate(output_sequences):
             generated_sequence = generated_sequence.tolist()
@@ -113,19 +104,6 @@ class DetectronGPTDiffusion(nn.Module):
         for i, g in enumerate(generated_sequences):
             res = str(g).replace("\n\n\n", "\n").replace("\n\n", "\n")
             lines = res.split("\n")
-            # # print(lines)
-            # i = max_repeat
-            # while i != len(lines):
-            #   remove_count = 0
-            #   for index in range(0, max_repeat):
-            #     # print(i - index - 1, i - index)
-            #     if lines[i - index - 1] == lines[i - index]:
-            #       remove_count += 1
-            #   if remove_count == max_repeat:
-            #     lines.pop(i)
-            #     i -= 1
-            #   else:
-            #     i += 1
             predictions.append("\n".join(lines))
 
         return predictions
@@ -168,7 +146,6 @@ class DetectronGPTDiffusion(nn.Module):
         return self.gpt_post_process(output_sequences, prompt)
 
     def generate_image(self, prompt, height=256, width=256):
-        # All of these parts are to pass CLIP's limit of 77 tokens
         max_length = self.diffusion_model.tokenizer.model_max_length
         input_ids = self.diffusion_model.tokenizer(
             prompt, return_tensors="pt"
@@ -234,7 +211,8 @@ class DetectronGPTDiffusion(nn.Module):
         )
         engineered_prompt = self.gpt_generate(prompt)[0]
         output_image = self.generate_image(engineered_prompt, height, width)[0]
-
+        # print(prompt)
+        # print(engineered_prompt)
         return {
             "manual_prompt": prompt,
             "output_prompt": engineered_prompt,
@@ -266,11 +244,19 @@ def _create_text_labels(classes, class_names, is_crowd=None):
     return labels
 
 
+## Second cell
+
+import torchvision.transforms as transforms
+from torchmetrics.functional import structural_similarity_index_measure as ssim
+
+im_transform = transforms.ToTensor()
+
+
 def ssim_loss(input_image, output_image):
     # Calculate the score between the input and output images
-    input_np = np.array(input_image)
-    output_np = np.array(output_image)
-    score = ssim(input_np, output_np, channel_axis=2)
+    input_torch = im_transform(input_image)
+    output_torch = im_transform(output_image)
+    score = ssim(input_torch.unsqueeze(0), output_torch.unsqueeze(0))
     return 1 - score
 
 
@@ -288,13 +274,15 @@ def get_image_filenames(directory):
 # Optimize the parameters of the gpt part of the model
 def optimize_gpt(
     model: DetectronGPTDiffusion,
-    num_steps=10,
+    n_epochs=1,
+    # if None selects the whole dataset, otherwise it'll use the first `dataset_size` points of it.
+    dataset_size=None,
     learning_rate=0.01,
 ):
     # Get the dataset
     dataset = get_image_filenames(
         "/content/drive/Shareddrives/COM SCI 263/Final Project/Data/COCO/val2017"
-    )[:num_steps]
+    )[:dataset_size]
     # We use run the model one time for each image in the dataset
     # (Filtered to only n_steps images)
     test, train = train_test_split(dataset, test_size=0.2, random_state=42)
@@ -309,21 +297,72 @@ def optimize_gpt(
         ]
     )
 
+    all_epoch_losses = []
+
     # Optimize the parameters
-    for i in range(num_steps):
-        # Reset the gradients
-        optimizer.zero_grad()
+    for epoch in range(n_epochs):
+        current_epoch_losses = []
+        print(f"Epoch #{epoch}:")
 
-        model_output = model.forward(train[i])
+        for step in range(len(train)):
+            # Reset the gradients
+            optimizer.zero_grad()
 
+            model_output = model.forward(train[i])
+
+            # Calculate the loss
+            loss = ssim_loss(model_output["input_image"], model_output["output_image"])
+
+            # Print the loss
+            if step % 5 == 0:
+                print(f"Step: {step}, Loss: {loss}")
+
+            # Backpropagate the loss
+            loss.requires_grad = True
+            loss.backward(retain_graph=True)
+
+            # Update the parameters
+            optimizer.step()
+
+            # Add the loss to the list of losses
+            current_epoch_losses.append(loss)
+
+        all_epoch_losses.append(current_epoch_losses)
+
+    return all_epoch_losses
+
+
+# Evaluate the gpt part of the model
+def evaluate_gpt(model: DetectronGPTDiffusion, dataset_size=None):
+    # Get the dataset
+    dataset = get_image_filenames(
+        "/content/drive/Shareddrives/COM SCI 263/Final Project/Data/COCO/val2017"
+    )[:dataset_size]
+    # We use run the model one time for each image in the dataset
+    # (Filtered to only n_steps images)
+    test, train = train_test_split(dataset, test_size=0.2, random_state=42)
+
+    all_losses = []
+
+    # Optimize the parameters
+    for i in range(len(test)):
+        model_output = model.forward(test[i])
         # Calculate the loss
         loss = ssim_loss(model_output["input_image"], model_output["output_image"])
-
         # Print the loss
         print(f"Step: {i}, Loss: {loss}")
+        # Add the loss to the list of losses
+        all_losses.append(loss)
 
-        # Backpropagate the loss
-        loss.backward()
+    # Calculate the average loss
+    average_loss = sum(all_losses) / len(all_losses)
+    print(f"Average loss: {average_loss}")
 
-        # Update the parameters
-        optimizer.step()
+
+# Visualize the loss over time
+def visualize_loss(all_epoch_losses):
+    # Visualize the loss
+    plt.plot(all_epoch_losses)
+    plt.xlabel("Step")
+    plt.ylabel("Loss")
+    plt.show()
