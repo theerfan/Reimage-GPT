@@ -272,19 +272,10 @@ def get_image_filenames(directory):
 # Optimize the parameters of the gpt part of the model
 def optimize_gpt(
     model: DetectronGPTDiffusion,
+    train,
     n_epochs=1,
-    # if None selects the whole dataset, otherwise it'll use the first `dataset_size` points of it.
-    dataset_size=None,
     learning_rate=0.01,
 ):
-    # Get the dataset
-    dataset = get_image_filenames(
-        "/content/drive/Shareddrives/COM SCI 263/Final Project/Data/COCO/val2017"
-    )[:dataset_size]
-    # We use run the model one time for each image in the dataset
-    # (Filtered to only n_steps images)
-    train, test = train_test_split(dataset, test_size=0.2, random_state=42)
-
     # Define the optimizer
     optimizer = torch.optim.Adam(
         [
@@ -331,15 +322,7 @@ def optimize_gpt(
 
 
 # Evaluate the gpt part of the model
-def evaluate_gpt(model: DetectronGPTDiffusion, dataset_size=None):
-    # Get the dataset
-    dataset = get_image_filenames(
-        "/content/drive/Shareddrives/COM SCI 263/Final Project/Data/COCO/val2017"
-    )[:dataset_size]
-    # We use run the model one time for each image in the dataset
-    # (Filtered to only n_steps images)
-    train, test = train_test_split(dataset, test_size=0.2, random_state=42)
-
+def evaluate_gpt(model: DetectronGPTDiffusion, test):
     all_losses = []
 
     # Optimize the parameters
@@ -360,23 +343,41 @@ def evaluate_gpt(model: DetectronGPTDiffusion, dataset_size=None):
 
 
 # Visualize the loss over time
-def visualize_loss(all_epoch_losses):
+def visualize_loss(all_epoch_losses, filename="loss.png"):
     # Visualize the loss
     plt.plot(all_epoch_losses)
     plt.xlabel("Step")
     plt.ylabel("Loss")
     plt.show()
+    plt.savefig(filename)
+
+
+def gen_test_train(
+    dataset_dir: str = "/content/drive/Shareddrives/COM SCI 263/Final Project/Data/COCO/val2017",
+    # if None selects the whole dataset, otherwise it'll use the first `dataset_size` points of it.
+    dataset_size: int = None,
+    test_size: float = 0.2,
+    random_state: int = 42,
+):
+    # Get the dataset
+    dataset = get_image_filenames(dataset_dir)[:dataset_size]
+    train, test = train_test_split(
+        dataset, test_size=test_size, random_state=random_state
+    )
+    return train, test
 
 
 pipeline = DetectronGPTDiffusion()
 
-total_losses = optimize_gpt(pipeline, n_epochs=2, dataset_size=10)
+train, test = gen_test_train("/notebooks/Data/COCO/val2017", dataset_size=500, test_size=0.2)
+
+total_losses = optimize_gpt(pipeline, train, n_epochs=1, learning_rate=0.01)
 total_losses = [[loss.detach().numpy() for loss in epoch_loss] for epoch_loss in total_losses]
 
-for epoch_losses in total_losses:
-    visualize_loss(epoch_losses)
+for i, epoch_losses in enumerate(total_losses):
+    visualize_loss(epoch_losses, f"loss_epoch_{i}.png")
 
-eval_losses = evaluate_gpt(pipeline, dataset_size=10)
+eval_losses = evaluate_gpt(pipeline, test)
 eval_losses = [loss.detach().numpy() for loss in eval_losses] 
 
-visualize_loss(eval_losses)
+visualize_loss(eval_losses, f"eval_loss.png")
